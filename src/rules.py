@@ -1,6 +1,35 @@
-from datetime import datetime, timedelta
+import hashlib
+import json
+from datetime import datetime, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+OFFLINE_SOURCES = ("vessel", "shore")
+RECOVERY_PAYLOAD_FIELDS = ("summary", "result", "notes")
+
+
+def parse_ts(value, field):
+    """Parse an ISO-8601 timestamp; naive values are assumed to be UTC."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(field + " must be an ISO-8601 timestamp")
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError:
+        raise ValidationError(field + " must be an ISO-8601 timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def content_hash(payload):
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def recovery_content(entry):
+    return {key: entry[key] for key in RECOVERY_PAYLOAD_FIELDS if entry.get(key) is not None}
 
 
 def _require(data, fields):
@@ -122,7 +151,29 @@ def _resolve_incident(actor, entity, data, lookup):
     assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
     if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
         raise ConflictError("affected asset is still unavailable")
-    return {"resolved_by": actor.user_id}
+    snapshot = {}
+    for telemetry in _all(lookup, "telemetry"):
+        rev = int(telemetry["data"].get("revision", 0) or 0)
+        if rev <= 0:
+            continue
+        key = telemetry["data"].get("asset_id") + "\0" + str(telemetry["data"].get("metric"))
+        if int(snapshot.get(key, 0)) < rev:
+            snapshot[key] = rev
+    return {
+        "resolved_by": actor.user_id,
+        "resolved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "resolved_revisions": snapshot,
+    }
+
+
+def _reopen_incident(actor, entity, data, lookup):
+    _require(data, ("reason", "affected_assets"))
+    if not isinstance(data["affected_assets"], list) or not data["affected_assets"]:
+        raise ValidationError("affected_assets must be a non-empty list")
+    return {
+        "reopened_by": actor.user_id,
+        "reopen_count": int(entity["data"].get("reopen_count", 0)) + 1,
+    }
 
 
 def _complete_action(actor, entity, data, lookup):
@@ -246,7 +297,7 @@ class RuleEngine:
         "start_recovery": ("admin", "operator", "engineer"),
         "resolve": ("admin", "engineer"),
         "close": ("admin", "engineer"),
-        "reopen": ("admin", "engineer", "operator"),
+        "reopen": ("admin", "engineer", "operator", "field"),
         "approve": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
         "succeed": ("admin", "engineer", "operator"),
@@ -268,6 +319,7 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "reopen"): _reopen_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
@@ -309,3 +361,234 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_offline_batch(self, actor, records, lookup):
+        """Structural and referential validation of one offline batch.
+
+        Returns (entries, errors). Nothing here mutates state: entries are
+        normalized records ready to merge, and every error carries the
+        record position so the whole batch can be rejected as one.
+        """
+        if "*" not in self.MERGE_ROLES and actor.role not in self.MERGE_ROLES:
+            raise PermissionDenied("role %s cannot merge offline records" % actor.role)
+        entries = []
+        errors = []
+        seen_duplicates = set()
+        seen_telemetry = {}
+        stored_revision = {}
+        for telemetry in _all(lookup, "telemetry"):
+            series_key = (telemetry["data"].get("asset_id"), telemetry["data"].get("metric"))
+            stored_revision[series_key] = max(
+                int(telemetry["data"].get("revision", 0) or 0),
+                stored_revision.get(series_key, 0),
+            )
+        if not isinstance(records, list):
+            return entries, [{"index": None, "record_id": None, "field": "records",
+                              "message": "records must be a list"}]
+
+        def fail(index, record_id, field, message):
+            errors.append({"index": index, "record_id": record_id, "field": field, "message": message})
+
+        for index, raw in enumerate(records):
+            record_id = raw.get("record_id") if isinstance(raw, dict) else None
+
+            def local(field, message):
+                fail(index, str(record_id) if record_id is not None else None, field, message)
+
+            if not isinstance(raw, dict):
+                local(None, "each record must be an object")
+                continue
+            rid = str(record_id or "").strip()
+            if not rid:
+                local("record_id", "record_id is required")
+                continue
+            kind = str(raw.get("kind", "recovery")).strip()
+            if kind not in ("recovery", "telemetry"):
+                local("kind", "kind must be recovery or telemetry")
+                continue
+            source = str(raw.get("source", "vessel")).strip()
+            if source not in OFFLINE_SOURCES:
+                local("source", "source must be vessel or shore")
+                continue
+            recorded = raw.get("recorded_at")
+            try:
+                recorded_at = parse_ts(recorded, "recorded_at")
+            except ValidationError as exc:
+                local("recorded_at", str(exc))
+                continue
+
+            if kind == "recovery":
+                incident_id = str(raw.get("incident_id") or "").strip()
+                incident = _find_one(lookup, "incident", "id", incident_id) if incident_id else None
+                if not incident_id:
+                    local("incident_id", "incident_id is required")
+                elif not incident:
+                    local("incident_id", "unknown incident: " + incident_id)
+                asset_id = str(raw.get("asset_id") or "").strip() or None
+                if not asset_id and incident:
+                    asset_id = incident["data"].get("asset_id")
+                if asset_id and not _find_one(lookup, "asset", "id", asset_id):
+                    local("asset_id", "unknown asset: " + asset_id)
+                payload = recovery_content(raw)
+                if not payload:
+                    local("summary", "at least one of summary/result/notes is required")
+                if errors and any(e["index"] == index for e in errors):
+                    continue
+                content = content_hash(payload)
+                duplicate_key = (rid, source, recorded_at.isoformat(), content)
+                if duplicate_key in seen_duplicates:
+                    local("record_id", "exact duplicate within batch")
+                    continue
+                seen_duplicates.add(duplicate_key)
+                entries.append({
+                    "entry_type": "recovery",
+                    "record_id": rid,
+                    "source": source,
+                    "recorded_at": recorded_at.isoformat(),
+                    "incident_id": incident_id,
+                    "asset_id": asset_id,
+                    "payload": payload,
+                    "content_hash": content,
+                })
+                continue
+
+            asset_id = str(raw.get("asset_id") or "").strip()
+            if not asset_id:
+                local("asset_id", "asset_id is required")
+            elif not _find_one(lookup, "asset", "id", asset_id):
+                local("asset_id", "unknown asset: " + asset_id)
+            metric = str(raw.get("metric") or "").strip()
+            if not metric:
+                local("metric", "metric is required")
+            try:
+                value = _number(raw.get("value"), "value")
+            except ValidationError as exc:
+                local("value", str(exc))
+                value = None
+            try:
+                revision = int(raw.get("revision"))
+            except (TypeError, ValueError):
+                local("revision", "revision must be an integer")
+                revision = None
+            else:
+                if revision < 1:
+                    local("revision", "revision must be positive")
+            observed = raw.get("observed_at")
+            try:
+                observed_at = parse_ts(observed, "observed_at")
+            except ValidationError:
+                local("observed_at", "observed_at must be an ISO-8601 timestamp")
+                observed_at = None
+            if errors and any(e["index"] == index for e in errors):
+                continue
+            series_key = (asset_id, metric)
+            if series_key not in stored_revision:
+                local("metric", "no telemetry series exists for %s/%s" % (asset_id, metric))
+                continue
+            if revision <= stored_revision[series_key]:
+                local("revision", "telemetry revision must be higher than stored %s"
+                      % stored_revision[series_key])
+                continue
+            if series_key in seen_telemetry and seen_telemetry[series_key] >= revision:
+                local("revision", "telemetry revisions for one series must strictly increase within the batch")
+                continue
+            seen_telemetry[series_key] = revision
+            entries.append({
+                "entry_type": "telemetry",
+                "record_id": rid,
+                "source": source,
+                "recorded_at": recorded_at.isoformat(),
+                "asset_id": asset_id,
+                "metric": metric,
+                "value": value,
+                "revision": revision,
+                "observed_at": observed_at.isoformat(),
+            })
+        return entries, errors
+
+    @staticmethod
+    def classify_version(existing, entry):
+        """Decide how an incoming recovery entry sits beside stored versions.
+
+        First-wins: the first version stored for a record_id stays canonical
+        forever and a later arrival never clobbers it. Source and timestamp
+        are kept on every row so the two sides' edits remain distinguishable.
+        - identical (record_id, source, recorded_at, payload) -> duplicate
+        - any other non-identical arrival                    -> conflict
+        - first version for this record_id                    -> canonical
+        """
+        same_time = [v for v in existing if v["recorded_at"] == entry["recorded_at"]]
+        if any(v["content_hash"] == entry["content_hash"] for v in same_time):
+            return "duplicate"
+        if existing:
+            return "conflict"
+        return "canonical"
+
+    def plan_reopens(self, telemetry_entries, recovery_entries, lookup):
+        """Recompute which resolved/closed incidents are invalidated.
+
+        Trigger A: a telemetry revision above the resolution snapshot.
+        Trigger B: an offline recovery record observed after resolution.
+        Both return the deduplicated list of affected assets per incident.
+        """
+        plans = {}
+
+        def bucket(incident_id):
+            return plans.setdefault(incident_id, {"reasons": [], "affected_assets": []})
+
+        def add_asset(bucket_ref, asset_id):
+            if asset_id and asset_id not in bucket_ref["affected_assets"]:
+                bucket_ref["affected_assets"].append(asset_id)
+
+        incidents = _all(lookup, "incident")
+        settled = [i for i in incidents if i["status"] in ("resolved", "closed")]
+        settled_by_asset = {}
+        for incident in settled:
+            asset_id = incident["data"].get("asset_id")
+            if asset_id:
+                settled_by_asset.setdefault(asset_id, []).append(incident)
+
+        telemetries = _all(lookup, "telemetry")
+        latest = {}
+        for telemetry in telemetries:
+            key = (telemetry["data"].get("asset_id"), telemetry["data"].get("metric"))
+            rev = int(telemetry["data"].get("revision", 0) or 0)
+            if rev > int(latest.get(key, {}).get("data", {}).get("revision", 0) or 0):
+                latest[key] = telemetry
+
+        for entry in telemetry_entries:
+            asset_id = entry["asset_id"]
+            series = latest.get((asset_id, entry["metric"]))
+            if not series:
+                continue
+            for incident in settled_by_asset.get(asset_id, []):
+                snapshot = incident["data"].get("resolved_revisions") or {}
+                seen_rev = int(snapshot.get(asset_id + "\0" + entry["metric"], 0) or 0)
+                if entry["revision"] > seen_rev:
+                    bucket_ref = bucket(incident["id"])
+                    reason = ("telemetry_revision:%s/%s rev %s > resolved %s"
+                              % (asset_id, entry["metric"], entry["revision"], seen_rev))
+                    if reason not in bucket_ref["reasons"]:
+                        bucket_ref["reasons"].append(reason)
+                    add_asset(bucket_ref, asset_id)
+
+        by_id = {incident["id"]: incident for incident in incidents}
+        for entry in recovery_entries:
+            incident = by_id.get(entry["incident_id"])
+            if not incident or incident["status"] not in ("resolved", "closed"):
+                continue
+            resolved_at = incident["data"].get("resolved_at")
+            if not resolved_at:
+                continue
+            if parse_ts(entry["recorded_at"], "recorded_at") > parse_ts(resolved_at, "resolved_at"):
+                bucket_ref = bucket(incident["id"])
+                reason = "offline_record_after_resolution:%s" % entry["recorded_at"]
+                if reason not in bucket_ref["reasons"]:
+                    bucket_ref["reasons"].append(reason)
+                add_asset(bucket_ref, entry["asset_id"])
+                add_asset(bucket_ref, incident["data"].get("asset_id"))
+        for plan in plans.values():
+            plan["affected_assets"].sort()
+        return plans
+
+    MERGE_ROLES = ("admin", "operator", "engineer", "field")

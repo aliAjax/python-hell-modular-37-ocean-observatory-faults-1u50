@@ -27,6 +27,19 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class MergeValidationError(DomainError):
+    """An offline batch was rejected; nothing from it is stored.
+
+    errors is a list of {"index", "record_id", "field", "message"}
+    locations so the submitter can fix and retry the same batch.
+    """
+
+    def __init__(self, batch_id, errors):
+        self.batch_id = batch_id
+        self.errors = errors
+        super().__init__("offline merge rejected with %d error(s)" % len(errors))
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

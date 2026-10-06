@@ -8,6 +8,7 @@ from .domain import (
     ConflictError,
     DomainError,
     InvalidTransition,
+    MergeValidationError,
     NotFoundError,
     PermissionDenied,
     ValidationError,
@@ -62,6 +63,15 @@ def create_handler(service, rules, static_dir):
                 status = 403
             elif isinstance(exc, NotFoundError):
                 status = 404
+            elif isinstance(exc, MergeValidationError):
+                status = 400
+                self._send(status, {
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                    "batch_id": exc.batch_id,
+                    "errors": exc.errors,
+                })
+                return
             elif isinstance(exc, (ConflictError, InvalidTransition)):
                 status = 409
             elif isinstance(exc, ValidationError):
@@ -84,6 +94,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 3 and parts[:2] == ["api", "offline-batches"]:
+                    return self._send(200, service.offline_batch(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "offline-records"] and parts[3] == "versions":
+                    return self._send(200, {"items": service.offline_versions(parts[2])})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -101,9 +115,12 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
-                if parts == ["api", "offline-records"]:
+                if parts == ["api", "offline-records"] or parts == ["api", "offline-merge"]:
                     body = self._body()
-                    return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                    records = body.get("records", [])
+                    batch_id = body.get("batch_id") or self.headers.get("X-Batch-Id")
+                    result = service.merge_offline(actor, records, batch_id=batch_id)
+                    return self._send(200, result)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
