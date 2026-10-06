@@ -1,6 +1,10 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _require(data, fields):
@@ -122,7 +126,7 @@ def _resolve_incident(actor, entity, data, lookup):
     assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
     if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
         raise ConflictError("affected asset is still unavailable")
-    return {"resolved_by": actor.user_id}
+    return {"resolved_by": actor.user_id, "resolved_at": _utcnow()}
 
 
 def _complete_action(actor, entity, data, lookup):
@@ -271,6 +275,7 @@ class RuleEngine:
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
+    MERGE_ROLES = ("admin", "engineer", "operator")
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -309,3 +314,133 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_merge_record(self, actor, record, lookup=None):
+        """Validate one offline record for merge. Returns the normalized record.
+
+        Judgment only: no persistence happens here. Raises ValidationError /
+        ConflictError on the first problem so the caller can abort the batch.
+        """
+        _ensure_role(actor, self.MERGE_ROLES)
+        if not isinstance(record, dict):
+            raise ValidationError("offline record must be an object")
+        source_id = str(record.get("source_id", "")).strip()
+        record_id = str(record.get("record_id", "")).strip()
+        if not source_id or not record_id:
+            raise ValidationError("source_id and record_id are required")
+        kind = self.normalize_kind(record.get("kind"))
+        if kind not in self.INITIAL_STATUS:
+            raise ValidationError("unknown kind: " + str(record.get("kind")))
+        data = record.get("data")
+        if not isinstance(data, dict):
+            raise ValidationError("record data must be an object")
+        recorded_at = record.get("recorded_at")
+        if recorded_at is not None and recorded_at != "":
+            if self._parse_ts(recorded_at) is None:
+                raise ValidationError("recorded_at must be a valid ISO timestamp")
+        revision = record.get("revision")
+        if revision is not None:
+            try:
+                revision = int(revision)
+            except (TypeError, ValueError):
+                raise ValidationError("revision must be an integer")
+            if revision < 1:
+                raise ValidationError("revision must be positive")
+        base_version = record.get("base_version")
+        if base_version is not None:
+            try:
+                base_version = int(base_version)
+            except (TypeError, ValueError):
+                raise ValidationError("base_version must be an integer")
+            if base_version < 1:
+                raise ValidationError("base_version must be positive")
+        self._validate_merge_data(kind, data, lookup)
+        return {
+            "source_id": source_id,
+            "record_id": record_id,
+            "kind": kind,
+            "entity_id": str(record.get("entity_id", "")).strip() or None,
+            "data": dict(data),
+            "revision": revision,
+            "recorded_at": recorded_at,
+            "base_version": base_version,
+            "base_updated_at": record.get("base_updated_at"),
+        }
+
+    @staticmethod
+    def _parse_ts(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _validate_merge_data(self, kind, data, lookup):
+        """Validate the data payload of a merge record.
+
+        Unlike validate_create this does not enforce uniqueness/revision
+        ordering, because merge resolves those itself. It only checks that
+        referenced entities exist and that values are well-formed.
+        """
+        if kind == "asset":
+            if data.get("station_id") and not _find_one(lookup, "station", "id", data.get("station_id")):
+                raise ValidationError("asset requires station")
+            if data.get("clock_offset_seconds") not in (None, ""):
+                _number(data.get("clock_offset_seconds"), "clock_offset_seconds")
+        elif kind == "link":
+            if data.get("station_id") and not _find_one(lookup, "station", "id", data.get("station_id")):
+                raise ValidationError("link requires station")
+            if data.get("asset_id") and not _find_one(lookup, "asset", "id", data.get("asset_id")):
+                raise ValidationError("link requires asset")
+            if data.get("capacity") not in (None, ""):
+                _number(data.get("capacity"), "capacity")
+        elif kind == "telemetry":
+            if data.get("asset_id") and not _find_one(lookup, "asset", "id", data.get("asset_id")):
+                raise ValidationError("telemetry requires asset")
+            if data.get("value") not in (None, ""):
+                _number(data.get("value"), "value")
+            if data.get("revision") is not None:
+                try:
+                    rev = int(data.get("revision"))
+                except (TypeError, ValueError):
+                    raise ValidationError("revision must be an integer")
+                if rev < 1:
+                    raise ValidationError("revision must be positive")
+        elif kind == "incident":
+            if data.get("severity") is not None and data.get("severity") not in ("low", "medium", "high", "critical"):
+                raise ValidationError("invalid incident severity")
+        elif kind == "recovery_action":
+            if data.get("incident_id") and not _find_one(lookup, "incident", "id", data.get("incident_id")):
+                raise ValidationError("recovery action requires an incident")
+            if data.get("action_type") is not None and data.get("action_type") not in ("remote_restart", "switch_backup", "firmware_rollback", "dispatch_mission"):
+                raise ValidationError("invalid action_type")
+        elif kind == "mission":
+            if data.get("station_id") and not _find_one(lookup, "station", "id", data.get("station_id")):
+                raise ValidationError("mission requires station")
+        elif kind == "gap":
+            if data.get("incident_id") and not _find_one(lookup, "incident", "id", data.get("incident_id")):
+                raise ValidationError("data gap requires incident")
+
+    def detect_conflict(self, entity, record):
+        """Decide whether the offline record and the online entity both
+        changed the same record, so two versions must be kept.
+
+        Pure judgment: telemetry merges by revision and never conflicts here;
+        other kinds conflict when the online version advanced past the base
+        the offline change was based on, or when data diverges with no base.
+        """
+        if entity["kind"] == "telemetry":
+            return False
+        base_version = record.get("base_version")
+        if base_version is not None:
+            return int(entity["version"]) != int(base_version)
+        base_updated_at = record.get("base_updated_at")
+        if base_updated_at:
+            base = self._parse_ts(base_updated_at)
+            current = self._parse_ts(entity["updated_at"])
+            if base and current:
+                return current > base
+        # No base information: keep two versions whenever data diverges, so a
+        # later arrival can never silently overwrite an earlier change.
+        return dict(entity.get("data", {})) != dict(record.get("data", {}))

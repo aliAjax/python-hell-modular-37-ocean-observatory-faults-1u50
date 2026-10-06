@@ -23,6 +23,21 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class BatchValidationError(DomainError):
+    """One record in a batch failed validation; nothing was persisted.
+
+    Carries the position of the offending record so callers can locate it.
+    """
+
+    def __init__(self, index, record_id, message):
+        self.index = index
+        self.record_id = record_id
+        location = "record at index %s" % index
+        if record_id:
+            location += " (record_id %s)" % record_id
+        super().__init__("%s: %s" % (location, message))
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
